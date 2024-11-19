@@ -235,7 +235,7 @@ def main():
 
     vector_store = initialize_vector_store(texts, embedding_model, persist_directory)
     # vector_store = FAISS.from_documents(texts, embedding_model)
-
+    #
     # prompt = """
     #     Answer the questions using the provided context. If the answer is not in the context, say "cannot find the context".
     #     Context: {context}
@@ -252,9 +252,9 @@ def main():
         # chain_type_kwargs={"prompt": QA_CHAIN_PROMPT}
     )
 
-    queries = ["分析一下苹果财报", "分析中国银行股份有限公司2024年第三季度报告"]
+    queries = ["分析一下苹果财报"]
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         for _ in tqdm(executor.map(partial(process_query, qa_chain, embedding_model, retriever), queries), desc="Processing queries"):
             pass
 
