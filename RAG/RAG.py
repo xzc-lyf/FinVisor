@@ -2,29 +2,30 @@ import logging
 import mimetypes
 import os
 import re
-import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
+import cv2
 import fitz
 import numpy as np
 import openpyxl
-import pandas as pd
+import pytesseract
 import requests
+from PIL import Image
 from bs4 import BeautifulSoup
 from colorama import Fore, Style, init
 from easyocr import easyocr
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-from langchain_community.vectorstores import Chroma, FAISS
+from langchain_community.vectorstores import Chroma
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import ChatOllama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
-from torch.compiler import disable
 from tqdm import tqdm
-from PIL import Image, ImageFilter
-import pytesseract
+from yolov5 import YOLOv5
+
+from demo.langchain3 import embedding_model
 
 # Initialize colorama for colored console output
 init(autoreset=True)
@@ -100,9 +101,25 @@ def load_text_from_file(file_path):
         raise ValueError(f"Unsupported file type for source: {file_path}")
 
 
+# def extract_text_from_pdf(file_path):
+#     with fitz.open(file_path) as pdf:
+#         return "".join([page.get_text() for page in pdf])
+
+
 def extract_text_from_pdf(file_path):
+    extracted_text = []
     with fitz.open(file_path) as pdf:
-        return "".join([page.get_text() for page in pdf])
+        for page in pdf:
+            text = page.get_text("text")
+            if text.strip():  # 如果提取到文本，直接使用
+                extracted_text.append(text)
+            else:  # 如果没有文本，使用 OCR
+                pix = page.get_pixmap()
+                # 将宽度和高度以元组形式传递
+                image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                text = pytesseract.image_to_string(image, lang='eng')
+                extracted_text.append(text)
+    return "\n".join(extracted_text)
 
 
 def extract_text_from_excel(file_path):
@@ -119,9 +136,27 @@ def extract_text_from_excel(file_path):
 
 
 def extract_text_from_image(file_path):
+    yolo_model = YOLOv5('yolov5s.pt')
+    # 1. 读取图片
+    image = cv2.imread(file_path)
+
+    # 2. 使用 YOLO 检测文本区域
+    results = yolo_model.predict(image)  # YOLOv5返回的结果包括bounding boxes和类别
+    text_boxes = results.xywh[0][:, :4].cpu().numpy()  # 获取检测到的文本区域（假设是第一个类）
+
+    # 3. 从检测到的区域中提取文本
     reader = easyocr.Reader(['ch_sim', 'en'], gpu=True)
-    results = reader.readtext(file_path)
-    extracted_text = "\n".join([text for _, text, _ in results])
+    extracted_text = ""
+    for box in text_boxes:
+        # 提取每个文本区域
+        x1, y1, x2, y2 = map(int, box)  # 得到左上角和右下角坐标
+        roi = image[y1:y2, x1:x2]  # 裁剪文本区域
+
+        # 使用 OCR 对该区域进行文本识别
+        result = reader.readtext(roi)
+        for _, text, _ in result:
+            extracted_text += text + "\n"
+
     return extracted_text
 
 
@@ -141,88 +176,130 @@ def split_text(text, chunk_size=1000, chunk_overlap=150):
     return text_splitter.create_documents([text])
 
 
-def clean_text(text):
-    text = re.sub(r'<.*?>', '', text)
-    text = re.sub(r'[^\w\s]', '', text)
+def clean_text(text, keep_punctuation=False):
+    # 移除 HTML 标签
+    text = re.sub(r'</?[a-zA-Z][^>]*>', '', text)
+    # 移除不可见字符（如控制字符）
+    text = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', text)
+    # 移除非字母数字字符，可选保留标点
+    if not keep_punctuation:
+        text = re.sub(r'[^\w\s]', '', text)
+    else:
+        text = re.sub(r'[^\w\s.,!?]', '', text)
+    # 合并多余空格并移除首尾空格
     text = re.sub(r'\s+', ' ', text).strip()
-    text = ''.join(ch for ch in text if unicodedata.category(ch)[0] != 'C')
     return text
 
 
 def calculate_similarity(query_embedding, doc_embedding):
+    """
+    计算两个嵌入之间的余弦相似度。
+    """
     if doc_embedding is None:
-        return 'N/A'
+        return 0.0  # 如果嵌入为空，直接返回最低分
     return np.dot(query_embedding, doc_embedding) / (np.linalg.norm(query_embedding) * np.linalg.norm(doc_embedding))
 
 
 def print_answer_and_sources(query, answer, source_documents, query_embedding):
     print(f"\n{COLOR_CYAN}Question:{RESET}\n{COLOR_WHITE}{query}{RESET}")
     print(f"\n{COLOR_YELLOW}Answer:{RESET}\n{COLOR_WHITE}{answer}{RESET}")
-    print(f"\n{COLOR_MAGENTA}Source Documents with Similarity Scores:{RESET}\n")
-    print(f"{'Document Excerpt':<50} {'Similarity Score':<20}")
+    print(f"\n{COLOR_MAGENTA}Source Documents with Similarity Scores:{RESET}")
 
-    print("-" * 70)
+    # 调整表头的格式
+    print(f"{'Document Excerpt':<60} {'Similarity Score':>10}")
+    print("-" * 80)
+
     for doc in source_documents:
-        doc_content = doc.page_content[:20] + "..." if len(doc.page_content) > 20 else doc.page_content
+        # 提取文档内容，截取前20个字符并添加省略号
+        doc_content = doc.page_content[:50] + "..." if len(doc.page_content) > 50 else doc.page_content
         doc_embedding = doc.metadata.get('embedding', None)
         score = calculate_similarity(query_embedding, doc_embedding)
+
+        # 如果相似度为空，显示为'N/A'，否则格式化为4位小数
         score_display = score if score == 'N/A' else f'{score:.4f}'
-        print(f"{doc_content:<50} {score_display:<20}")
-    print("-" * 70)
+
+        # 格式化打印文档内容和相似度分数
+        print(f"{doc_content:<60} {score_display:>10}")
+
+    print("-" * 80)
 
 
-def find_best_documents(query_embedding, docs):
-    best_score = 0
-    best_docs = []
+def find_best_documents(query_embedding, docs, top_k=3):
+    scored_docs = []
     for doc in docs:
         doc_embedding = doc.metadata.get('embedding')
-        score = calculate_similarity(query_embedding, doc_embedding)
-        if score > best_score:
-            best_score = score
-            best_docs = [doc]
-    return best_score, best_docs
+        if doc_embedding is not None:
+            score = calculate_similarity(query_embedding, doc_embedding)
+            scored_docs.append((score, doc))
+
+    # 按分数排序并返回前 top_k 个文档
+    scored_docs.sort(reverse=True, key=lambda x: x[0])
+    best_docs = [doc for _, doc in scored_docs[:top_k]]
+    return scored_docs[:top_k]  # 返回 (score, doc) 的元组列表
 
 
-def self_critic_retrieval(retriever, qa_chain, query, initial_docs, query_embedding, feedback_threshold=0.2):
-    best_score, best_docs = find_best_documents(query_embedding, initial_docs)
+def process_query(qa_chain, embedding_model, retriever, query, similarity_threshold=0.5, top_k=3):
+    # Step 1: 使用 QA Chain 获取初始答案和来源文档
+    response = qa_chain.invoke({"query": query})
+    source_documents = response["source_documents"]
 
-    if best_score < feedback_threshold:
-        print(f"{COLOR_YELLOW}Initial answer confidence is low (score: {best_score:.4f}), retrying...{RESET}")
-        retriever.search_kwargs['k'] = 5
-        response = qa_chain.invoke({"query": query})
-        adjusted_answer = response['result']
-        adjusted_source_docs = response["source_documents"]
-        best_docs = adjusted_source_docs if best_score < feedback_threshold else initial_docs
-        final_answer = adjusted_answer if best_score < feedback_threshold else response['result']
-    else:
-        final_answer = initial_docs[0].metadata['answer']
+    # Step 2: 生成查询的嵌入
+    query_embedding = embedding_model.embed_query(query)
 
-    print(f"\n{COLOR_CYAN}Question:{RESET} {query}")
-    print(f"{COLOR_YELLOW}Final Answer:{RESET} {final_answer}")
-    print(f"{COLOR_MAGENTA}Source Documents:{RESET}")
-    print_answer_and_sources(query, final_answer, best_docs, query_embedding)
+    # Step 3: 为文档生成嵌入（如果未生成）
+    for doc in source_documents:
+        if 'embedding' not in doc.metadata:
+            doc.metadata['embedding'] = embedding_model.embed_query(doc.page_content)
 
+    # Step 4: 找到最相似的文档
+    best_docs_with_scores = find_best_documents(query_embedding, source_documents, top_k=top_k)
+    best_docs = [doc for _, doc in best_docs_with_scores]
+
+    # 输出初始答案和前 top_k 个来源文档
+    print_answer_and_sources(query, response['result'], best_docs, query_embedding)
+
+    # Step 5: 通过自我批评机制验证答案准确性
+    final_answer = self_critic_retrieval(
+        query=query,
+        generated_answer=response['result'],
+        query_embedding=query_embedding,
+        best_docs_with_scores=best_docs_with_scores,
+        retriever=retriever,
+        similarity_threshold=similarity_threshold,
+    )
+
+    # 输出最终答案和最佳文档
+    print(f"Final Answer (after self-critic validation): {final_answer}")
     return final_answer
 
 
-def process_query(qa_chain, embedding_model, retriever, query):
-    try:
-        response = qa_chain.invoke({"query": query})
-        source_documents = response["source_documents"]
-        query_embedding = embedding_model.embed_query(query)
+def self_critic_retrieval(query, generated_answer, query_embedding, best_docs_with_scores, retriever, similarity_threshold=0.5):
+    """
+    通过自我批评机制验证生成的答案，并在必要时重新检索或优化答案。
+    """
+    # 获取最高分文档及其分数
+    best_score, best_doc = best_docs_with_scores[0] if best_docs_with_scores else (0, None)
 
-        for doc in source_documents:
+    # Step 1: 如果最相似文档的得分低于阈值，重新检索
+    if best_score < similarity_threshold:
+        print(f"Low similarity score ({best_score}). Retrieving more documents...")
+        new_response = retriever({"query": query, "k": 5})
+        new_source_documents = new_response["source_documents"]
+
+        # 为新文档生成嵌入
+        for doc in new_source_documents:
             if 'embedding' not in doc.metadata:
                 doc.metadata['embedding'] = embedding_model.embed_query(doc.page_content)
 
-        print_answer_and_sources(query, response['result'], source_documents, query_embedding)
+        # 再次寻找最佳文档
+        best_docs_with_scores = find_best_documents(query_embedding, new_source_documents)
+        best_docs = [doc for _, doc in best_docs_with_scores]
 
-        final_answer = self_critic_retrieval(retriever, qa_chain, query, source_documents, query_embedding)
-        return final_answer
+        # 使用新的文档重新生成答案
+        return new_response["result"]
 
-    except Exception as e:
-        print(f"Error processing query: {str(e)}")
-        return None
+    # Step 2: 如果得分较高，直接返回原答案
+    return generated_answer
 
 
 def main():
@@ -231,17 +308,25 @@ def main():
     texts = load_and_process_files(files_path_lists)
 
     persist_directory = "./vector_store"
-    embedding_model = SentenceTransformersEmbedding("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+    embedding_model = SentenceTransformersEmbedding("sentence-transformers/all-MiniLM-L6-v2")
 
     vector_store = initialize_vector_store(texts, embedding_model, persist_directory)
     # vector_store = FAISS.from_documents(texts, embedding_model)
-    #
-    # prompt = """
-    #     Answer the questions using the provided context. If the answer is not in the context, say "cannot find the context".
-    #     Context: {context}
-    #     Question: {question}
-    #     Answer:
-    # """
+
+    prompt_template = PromptTemplate(
+        input_variables=["context", "question"],
+        template="""
+                You are a helpful assistant that answers questions based on provided context.
+
+                The following documents were retrieved to help answer the question:
+                {context}
+
+                Question: {question}
+
+                Answer:
+                If the answer can be found in the context, provide it. If the answer cannot be determined from the context, respond with "Cannot find the context."
+            """
+    )
 
     retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 3})
     qa_chain = RetrievalQA.from_chain_type(
@@ -249,10 +334,10 @@ def main():
         chain_type="stuff",
         retriever=retriever,
         return_source_documents=True,
-        # chain_type_kwargs={"prompt": QA_CHAIN_PROMPT}
+        chain_type_kwargs={"prompt": prompt_template}
     )
 
-    queries = ["分析一下苹果财报"]
+    queries = ["Please analyze Total operating expenses of Apple Inc. in detail.", "请分析中国银行的合并及母公司资产负债表"]
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         for _ in tqdm(executor.map(partial(process_query, qa_chain, embedding_model, retriever), queries), desc="Processing queries"):
