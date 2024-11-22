@@ -3,7 +3,6 @@ import mimetypes
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 
 import cv2
 import fitz
@@ -22,10 +21,10 @@ from langchain_core.embeddings import Embeddings
 from langchain_ollama import ChatOllama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
-from tqdm import tqdm
 from yolov5 import YOLOv5
 
-from demo.langchain3 import embedding_model
+from tqdm import tqdm
+tqdm.disable = True  # 全局禁用进度条
 
 # Initialize colorama for colored console output
 init(autoreset=True)
@@ -46,17 +45,25 @@ COLOR_WHITE = Fore.WHITE
 RESET = Style.RESET_ALL
 
 
+# Embedding类
 class SentenceTransformersEmbedding(Embeddings):
     def __init__(self, model_name: str):
         self.model = SentenceTransformer(model_name)
 
     def embed_documents(self, texts):
-        return self.model.encode(texts, convert_to_tensor=False, show_progress_bar=True).tolist()
+        embeddings = self.model.encode(texts, convert_to_tensor=False, show_progress_bar=False).tolist()
+        if not embeddings:
+            raise ValueError("No embeddings generated for the documents.")
+        return embeddings
 
     def embed_query(self, text):
-        return self.model.encode([text], convert_to_tensor=False, show_progress_bar=True).tolist()[0]
+        embedding = self.model.encode([text], convert_to_tensor=False, show_progress_bar=False).tolist()[0]
+        if not embedding:
+            raise ValueError("No embedding generated for the query.")
+        return embedding
 
 
+# 文件加载与预处理
 def load_and_process_files(files_path_lists):
     texts = []
     for file_path in files_path_lists:
@@ -66,14 +73,16 @@ def load_and_process_files(files_path_lists):
     return texts
 
 
+# 初始化向量存储
 def initialize_vector_store(texts, embedding_model, persist_directory):
     if os.path.exists(persist_directory):
-        logging.info(f"{COLOR_YELLOW}Loading existing vector store...{RESET}")
+        logging.info("Loading existing vector store...")
     else:
-        logging.info(f"{COLOR_YELLOW}Creating new vector store...{RESET}")
+        logging.info("Creating new vector store...")
     return Chroma.from_documents(texts, embedding=embedding_model, persist_directory=persist_directory)
 
 
+# 文件路径获取
 def attain_paths_of_all_files(directory_path):
     supported_extensions = (".txt", ".pdf", ".xlsx", ".csv", ".jpg", ".png")
     files_paths = []
@@ -84,6 +93,7 @@ def attain_paths_of_all_files(directory_path):
     return files_paths
 
 
+# 文件加载
 def load_text_from_file(file_path):
     mime_type, _ = mimetypes.guess_type(file_path)
     if mime_type == 'text/plain':
@@ -99,11 +109,6 @@ def load_text_from_file(file_path):
         return extract_text_from_webpage(file_path)
     else:
         raise ValueError(f"Unsupported file type for source: {file_path}")
-
-
-# def extract_text_from_pdf(file_path):
-#     with fitz.open(file_path) as pdf:
-#         return "".join([page.get_text() for page in pdf])
 
 
 def extract_text_from_pdf(file_path):
@@ -167,6 +172,7 @@ def extract_text_from_webpage(url):
     return soup.get_text(separator="\n")
 
 
+# 文本分割
 def split_text(text, chunk_size=1000, chunk_overlap=150):
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
@@ -176,52 +182,22 @@ def split_text(text, chunk_size=1000, chunk_overlap=150):
     return text_splitter.create_documents([text])
 
 
+# 文本清理
 def clean_text(text, keep_punctuation=False):
-    # 移除 HTML 标签
     text = re.sub(r'</?[a-zA-Z][^>]*>', '', text)
-    # 移除不可见字符（如控制字符）
     text = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', text)
-    # 移除非字母数字字符，可选保留标点
     if not keep_punctuation:
         text = re.sub(r'[^\w\s]', '', text)
     else:
         text = re.sub(r'[^\w\s.,!?]', '', text)
-    # 合并多余空格并移除首尾空格
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 
 def calculate_similarity(query_embedding, doc_embedding):
-    """
-    计算两个嵌入之间的余弦相似度。
-    """
     if doc_embedding is None:
         return 0.0  # 如果嵌入为空，直接返回最低分
     return np.dot(query_embedding, doc_embedding) / (np.linalg.norm(query_embedding) * np.linalg.norm(doc_embedding))
-
-
-def print_answer_and_sources(query, answer, source_documents, query_embedding):
-    print(f"\n{COLOR_CYAN}Question:{RESET}\n{COLOR_WHITE}{query}{RESET}")
-    print(f"\n{COLOR_YELLOW}Answer:{RESET}\n{COLOR_WHITE}{answer}{RESET}")
-    print(f"\n{COLOR_MAGENTA}Source Documents with Similarity Scores:{RESET}")
-
-    # 调整表头的格式
-    print(f"{'Document Excerpt':<60} {'Similarity Score':>10}")
-    print("-" * 80)
-
-    for doc in source_documents:
-        # 提取文档内容，截取前20个字符并添加省略号
-        doc_content = doc.page_content[:50] + "..." if len(doc.page_content) > 50 else doc.page_content
-        doc_embedding = doc.metadata.get('embedding', None)
-        score = calculate_similarity(query_embedding, doc_embedding)
-
-        # 如果相似度为空，显示为'N/A'，否则格式化为4位小数
-        score_display = score if score == 'N/A' else f'{score:.4f}'
-
-        # 格式化打印文档内容和相似度分数
-        print(f"{doc_content:<60} {score_display:>10}")
-
-    print("-" * 80)
 
 
 def find_best_documents(query_embedding, docs, top_k=3):
@@ -238,29 +214,53 @@ def find_best_documents(query_embedding, docs, top_k=3):
     return scored_docs[:top_k]  # 返回 (score, doc) 的元组列表
 
 
+def print_answer_and_sources(agent_name, query, answer, source_documents, query_embedding):
+    """打印问题、答案以及来源文档的相似度评分"""
+    print(f"\n\033[94mAgent [{agent_name}] Processing:\033[0m")
+    print(f"\n\033[96mQuestion:\033[0m\n{query}")
+    print(f"\n\033[93mAnswer:\033[0m\n{answer}")
+    print(f"\n\033[95mSource Documents with Similarity Scores:\033[0m")
+
+    # 表头和分割线
+    print(f"{'Document Excerpt':<60} {'Similarity Score':>10}")
+    print("-" * 80)
+
+    for doc in source_documents:
+        doc_content = doc.page_content[:50] + "..." if len(doc.page_content) > 50 else doc.page_content
+        doc_embedding = doc.metadata.get('embedding', None)
+        score = calculate_similarity(query_embedding, doc_embedding)
+
+        score_display = f"{score:.4f}" if score is not None else "N/A"
+        print(f"{doc_content:<60} {score_display:>10}")
+
+    print("-" * 80)
+
+
 def process_query(qa_chain, embedding_model, retriever, query, similarity_threshold=0.5, top_k=3):
+    """处理查询并打印问题、答案和来源文档信息"""
     # Step 1: 使用 QA Chain 获取初始答案和来源文档
     response = qa_chain.invoke({"query": query})
     source_documents = response["source_documents"]
 
     # Step 2: 生成查询的嵌入
-    query_embedding = embedding_model.embed_query(query)
+    query_embedding = embedding_model.generate_embedding(query)
 
     # Step 3: 为文档生成嵌入（如果未生成）
     for doc in source_documents:
         if 'embedding' not in doc.metadata:
-            doc.metadata['embedding'] = embedding_model.embed_query(doc.page_content)
+            doc.metadata['embedding'] = embedding_model.generate_embedding(doc.page_content)
 
     # Step 4: 找到最相似的文档
     best_docs_with_scores = find_best_documents(query_embedding, source_documents, top_k=top_k)
     best_docs = [doc for _, doc in best_docs_with_scores]
 
-    # 输出初始答案和前 top_k 个来源文档
+    # 打印问题、答案和来源文档
     print_answer_and_sources(query, response['result'], best_docs, query_embedding)
 
-    # Step 5: 通过自我批评机制验证答案准确性
+    # Step 5: 自我批评机制验证答案
     final_answer = self_critic_retrieval(
         query=query,
+        embedding_model=embedding_model,
         generated_answer=response['result'],
         query_embedding=query_embedding,
         best_docs_with_scores=best_docs_with_scores,
@@ -268,15 +268,12 @@ def process_query(qa_chain, embedding_model, retriever, query, similarity_thresh
         similarity_threshold=similarity_threshold,
     )
 
-    # 输出最终答案和最佳文档
-    print(f"Final Answer (after self-critic validation): {final_answer}")
+    print(f"\n\033[92mFinal Answer (after self-critic validation):\033[0m\n{final_answer}")
     return final_answer
 
 
-def self_critic_retrieval(query, generated_answer, query_embedding, best_docs_with_scores, retriever, similarity_threshold=0.5):
-    """
-    通过自我批评机制验证生成的答案，并在必要时重新检索或优化答案。
-    """
+def self_critic_retrieval(query, embedding_model, generated_answer, query_embedding, best_docs_with_scores, retriever,
+                          similarity_threshold=0.5):
     # 获取最高分文档及其分数
     best_score, best_doc = best_docs_with_scores[0] if best_docs_with_scores else (0, None)
 
@@ -302,33 +299,127 @@ def self_critic_retrieval(query, generated_answer, query_embedding, best_docs_wi
     return generated_answer
 
 
+# Agents
+class EmbeddingAgent:
+    def __init__(self, embedding_model):
+        self.embedding_model = embedding_model
+
+    def generate_embedding(self, text):
+        return self.embedding_model.embed_query(text)
+
+
+class RetrievalAgent:
+    def __init__(self, retriever):
+        self.retriever = retriever
+
+    def retrieve_documents(self, query, k=3):
+        # 使用 retriever 的 invoke 方法替代 get_relevant_documents
+        return self.retriever.invoke({"query": query, "k": k})
+
+
+class QAAgent:
+    def __init__(self, qa_chain):
+        self.qa_chain = qa_chain
+
+    def generate_answer(self, query, query_embedding, source_documents, agent_name="QAAgent"):
+        # Step 1: 生成答案
+        response = self.qa_chain.invoke({"query": query})
+        answer = response["result"]
+
+        # Step 2: 打印答案和来源文档
+        print_answer_and_sources(agent_name, query, answer, source_documents, query_embedding)
+        return answer
+
+
+class CriticAgent:
+    def __init__(self, similarity_threshold=0.5):
+        self.similarity_threshold = similarity_threshold
+
+    def validate_answer(self, query, query_embedding, best_docs_with_scores, retriever, qa_agent,
+                        agent_name="CriticAgent"):
+        best_score, _ = best_docs_with_scores[0] if best_docs_with_scores else (0, None)
+
+        if best_score < self.similarity_threshold:
+            print(
+                f"\n\033[93m[{agent_name}] Low similarity score ({best_score:.4f}). Retrieving more documents...\033[0m")
+
+            # Retrieve new documents
+            new_documents = retriever.retrieve_documents(query, k=5)
+            answer = qa_agent.generate_answer(query, query_embedding, new_documents, agent_name)
+            return answer
+
+        print(f"\n\033[92m[{agent_name}] High similarity score ({best_score:.4f}). Keeping original answer.\033[0m")
+        return None
+
+
+class MultiAgentRAG:
+    def __init__(self, embedding_agent, retrieval_agent, qa_agent, critic_agent):
+        self.embedding_agent = embedding_agent
+        self.retrieval_agent = retrieval_agent
+        self.qa_agent = qa_agent
+        self.critic_agent = critic_agent
+
+    def process_query(self, query, top_k=3):
+        print(f"\nProcessing query: {query}")
+
+        # Step 1: Generate query embedding
+        query_embedding = self.embedding_agent.generate_embedding(query)
+
+        # Step 2: Retrieve documents
+        source_documents = self.retrieval_agent.retrieve_documents(query, k=top_k)
+
+        # Step 3: Generate embeddings for documents (if not already generated)
+        for doc in source_documents:
+            if 'embedding' not in doc.metadata:
+                doc.metadata['embedding'] = self.embedding_agent.generate_embedding(doc.page_content)
+
+        # Step 4: Find best documents
+        best_docs_with_scores = find_best_documents(query_embedding, source_documents, top_k=top_k)
+        best_docs = [doc for _, doc in best_docs_with_scores]
+
+        # Step 5: Generate initial answer
+        initial_answer = self.qa_agent.generate_answer(query, query_embedding, best_docs)
+
+        # Step 6: Validate answer using critic agent
+        final_answer = self.critic_agent.validate_answer(
+            query=query,
+            query_embedding=query_embedding,
+            best_docs_with_scores=best_docs_with_scores,
+            retriever=self.retrieval_agent,
+            qa_agent=self.qa_agent
+        ) or initial_answer
+
+        # Output final answer
+        print(f"\n\033[92mFinal Answer:\033[0m\n{final_answer}")
+        return final_answer
+
+
+# Main Function
 def main():
     llm = ChatOllama(model="llama3.1:latest")
-    files_path_lists = attain_paths_of_all_files("/Users/xzc/Library/Mobile Documents/com~apple~CloudDocs/CUHK/CMSC5720Project/LLM/data")
+    files_path_lists = attain_paths_of_all_files(
+        "/Users/xzc/Library/Mobile Documents/com~apple~CloudDocs/CUHK/CMSC5720Project/LLM/data")
     texts = load_and_process_files(files_path_lists)
 
-    persist_directory = "./vector_store"
-    embedding_model = SentenceTransformersEmbedding("sentence-transformers/all-MiniLM-L6-v2")
-
-    vector_store = initialize_vector_store(texts, embedding_model, persist_directory)
-    # vector_store = FAISS.from_documents(texts, embedding_model)
+    # Initialize agents
+    embedding_model = SentenceTransformersEmbedding("sentence-transformers/all-MiniLM-L12-v2")
+    vector_store = initialize_vector_store(texts, embedding_model, persist_directory="./vector_store")
+    retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 3})
 
     prompt_template = PromptTemplate(
         input_variables=["context", "question"],
         template="""
-                You are a helpful assistant that answers questions based on provided context.
+            You are a helpful assistant that answers questions based on provided context.
 
-                The following documents were retrieved to help answer the question:
-                {context}
+            The following documents were retrieved to help answer the question:
+            {context}
 
-                Question: {question}
+            Question: {question}
 
-                Answer:
-                If the answer can be found in the context, provide it. If the answer cannot be determined from the context, respond with "Cannot find the context."
-            """
+            Answer: If the answer can be found in the context, provide it. If the answer cannot be determined from the context, respond with "Cannot find the context."
+        """
     )
 
-    retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 3})
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
@@ -337,11 +428,22 @@ def main():
         chain_type_kwargs={"prompt": prompt_template}
     )
 
-    queries = ["Please analyze Total operating expenses of Apple Inc. in detail.", "请分析中国银行的合并及母公司资产负债表"]
+    embedding_agent = EmbeddingAgent(embedding_model)
+    retrieval_agent = RetrievalAgent(retriever)
+    qa_agent = QAAgent(qa_chain)
+    critic_agent = CriticAgent(similarity_threshold=0.5)
+
+    # Initialize Multi-Agent RAG system
+    multi_agent_rag = MultiAgentRAG(embedding_agent, retrieval_agent, qa_agent, critic_agent)
+
+    # Process queries
+    queries = ["Please analyze Total operating expenses of Apple Inc. in detail.",
+               "请分析中国银行的合并及母公司资产负债表"]
 
     with ThreadPoolExecutor(max_workers=10) as executor:
-        for _ in tqdm(executor.map(partial(process_query, qa_chain, embedding_model, retriever), queries), desc="Processing queries"):
+        for _ in executor.map(multi_agent_rag.process_query, queries):
             pass
+
 
 if __name__ == "__main__":
     main()
