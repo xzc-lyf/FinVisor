@@ -33,7 +33,7 @@ def initialize_system():
 
     # Load files and preprocess text
     files_path_lists = attain_paths_of_all_files(
-        "/Users/xzc/Library/Mobile Documents/com~apple~CloudDocs/CUHK/CMSC5720Project/LLM/data"
+        "/Users/xzc/Library/Mobile Documents/com~apple~CloudDocs/CUHK/CMSC5720I-Project/LLM/data"
     )
     texts = load_and_process_files(files_path_lists)
 

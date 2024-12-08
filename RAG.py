@@ -45,24 +45,6 @@ COLOR_WHITE = Fore.WHITE
 RESET = Style.RESET_ALL
 
 
-# Embedding类
-class SentenceTransformersEmbedding(Embeddings):
-    def __init__(self, model_name: str):
-        self.model = SentenceTransformer(model_name)
-
-    def embed_documents(self, texts):
-        embeddings = self.model.encode(texts, convert_to_tensor=False, show_progress_bar=False).tolist()
-        if not embeddings:
-            raise ValueError("No embeddings generated for the documents.")
-        return embeddings
-
-    def embed_query(self, text):
-        embedding = self.model.encode([text], convert_to_tensor=False, show_progress_bar=False).tolist()[0]
-        if not embedding:
-            raise ValueError("No embedding generated for the query.")
-        return embedding
-
-
 # 文件加载与预处理
 def load_and_process_files(files_path_lists):
     texts = []
@@ -71,15 +53,6 @@ def load_and_process_files(files_path_lists):
         cleaned_text = clean_text(raw_text)
         texts.extend(split_text(cleaned_text))
     return texts
-
-
-# 初始化向量存储
-def initialize_vector_store(texts, embedding_model, persist_directory):
-    if os.path.exists(persist_directory):
-        logging.info("Loading existing vector store...")
-    else:
-        logging.info("Creating new vector store...")
-    return Chroma.from_documents(texts, embedding=embedding_model, persist_directory=persist_directory)
 
 
 # 文件路径获取
@@ -192,6 +165,33 @@ def clean_text(text, keep_punctuation=False):
         text = re.sub(r'[^\w\s.,!?]', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
+
+
+# Embedding类
+class SentenceTransformersEmbedding(Embeddings):
+    def __init__(self, model_name: str):
+        self.model = SentenceTransformer(model_name)
+
+    def embed_documents(self, texts):
+        embeddings = self.model.encode(texts, convert_to_tensor=False, show_progress_bar=False).tolist()
+        if not embeddings:
+            raise ValueError("No embeddings generated for the documents.")
+        return embeddings
+
+    def embed_query(self, text):
+        embedding = self.model.encode([text], convert_to_tensor=False, show_progress_bar=False).tolist()[0]
+        if not embedding:
+            raise ValueError("No embedding generated for the query.")
+        return embedding
+
+
+# 初始化向量存储
+def initialize_vector_store(texts, embedding_model, persist_directory):
+    if os.path.exists(persist_directory):
+        logging.info("Loading existing vector store...")
+    else:
+        logging.info("Creating new vector store...")
+    return Chroma.from_documents(texts, embedding=embedding_model, persist_directory=persist_directory)
 
 
 def calculate_similarity(query_embedding, doc_embedding):
@@ -331,25 +331,63 @@ class QAAgent:
         return answer
 
 
-class CriticAgent:
-    def __init__(self, similarity_threshold=0.5):
-        self.similarity_threshold = similarity_threshold
 
-    def validate_answer(self, query, query_embedding, best_docs_with_scores, retriever, qa_agent,
-                        agent_name="CriticAgent"):
+
+class CriticAgent:
+    def __init__(self, similarity_threshold=0.5, retriever=None, semantic_retriever=None):
+        self.similarity_threshold = similarity_threshold
+        self.retriever = retriever  # 基础检索器（TF-IDF、BM25等）
+        self.semantic_retriever = semantic_retriever  # 语义检索器（如 Sentence-BERT）
+
+    def find_best_documents(self, query_embedding, docs, top_k=3):
+        """
+        在静态文档集合中进行相似度排序。
+        """
+        scored_docs = []
+        for doc in docs:
+            doc_embedding = doc.metadata.get('embedding')
+            if doc_embedding is not None:
+                # 使用余弦相似度计算
+                score = self.calculate_similarity(query_embedding, doc_embedding)
+                scored_docs.append((score, doc))
+
+        # 按分数排序并返回前 top_k 个文档
+        scored_docs.sort(reverse=True, key=lambda x: x[0])
+        return scored_docs[:top_k]
+
+    def validate_answer(self, query, query_embedding, best_docs_with_scores, qa_agent, agent_name="CriticAgent"):
+        """
+        检查初始文档集的质量，必要时动态扩展检索范围。
+        """
         best_score, _ = best_docs_with_scores[0] if best_docs_with_scores else (0, None)
 
+        # 如果相似度低于阈值，触发新的检索逻辑
         if best_score < self.similarity_threshold:
-            print(
-                f"\n\033[93m[{agent_name}] Low similarity score ({best_score:.4f}). Retrieving more documents...\033[0m")
+            print(f"\n\033[93m[{agent_name}] Low similarity score ({best_score:.4f}). Retrieving more documents...\033[0m")
 
-            # Retrieve new documents
-            new_documents = retriever.retrieve_documents(query, k=5)
-            answer = qa_agent.generate_answer(query, query_embedding, new_documents, agent_name)
+            # 动态扩展：语义检索 + 多上下文
+            alternative_contexts = ["economic analysis", "market trends"]
+            additional_docs = []
+            for context in alternative_contexts:
+                extra_docs = self.semantic_retriever.retrieve_documents(query, context=context, k=5)
+                additional_docs.extend(extra_docs)
+
+            # 对扩展文档重新排序
+            reranked_docs = self.find_best_documents(query_embedding, additional_docs, top_k=5)
+            answer = qa_agent.generate_answer(query, query_embedding, [doc for _, doc in reranked_docs], agent_name)
             return answer
 
         print(f"\n\033[92m[{agent_name}] High similarity score ({best_score:.4f}). Keeping original answer.\033[0m")
         return None
+
+    def calculate_similarity(self, query_embedding, doc_embedding):
+        """
+        使用余弦相似度计算相似性分数。
+        """
+        return np.dot(query_embedding, doc_embedding) / (
+            np.linalg.norm(query_embedding) * np.linalg.norm(doc_embedding)
+        )
+
 
 
 class MultiAgentRAG:
@@ -385,7 +423,6 @@ class MultiAgentRAG:
             query=query,
             query_embedding=query_embedding,
             best_docs_with_scores=best_docs_with_scores,
-            retriever=self.retrieval_agent,
             qa_agent=self.qa_agent
         ) or initial_answer
 
@@ -398,7 +435,7 @@ class MultiAgentRAG:
 def main():
     llm = ChatOllama(model="llama3.1:latest")
     files_path_lists = attain_paths_of_all_files(
-        "/Users/xzc/Library/Mobile Documents/com~apple~CloudDocs/CUHK/CMSC5720Project/LLM/data")
+        "/Users/xzc/Library/Mobile Documents/com~apple~CloudDocs/CUHK/CMSC5720I-Project/LLM/data")
     texts = load_and_process_files(files_path_lists)
 
     # Initialize agents
@@ -437,8 +474,7 @@ def main():
     multi_agent_rag = MultiAgentRAG(embedding_agent, retrieval_agent, qa_agent, critic_agent)
 
     # Process queries
-    queries = ["Please analyze Total operating expenses of Apple Inc. in detail.",
-               "请分析中国银行的合并及母公司资产负债表"]
+    queries = ["Please analyze Apple Inc.'s Operating expenses in detail"]
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         for _ in executor.map(multi_agent_rag.process_query, queries):
